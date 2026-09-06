@@ -119,13 +119,15 @@ func (b Builder) Build(ctx context.Context, checkpointID id.CheckpointID) (*Cont
 			HasReview:        summary.HasReview,
 			HasInvestigation: summary.HasInvestigation,
 		},
-		FilesTouched: appendSortedUnique(nil, summary.FilesTouched...),
-		TokenUsage:   summary.TokenUsage,
-		Graph:        GraphContext{Available: false, UnavailableReason: "graph provider not configured"},
+		FilesTouched:   appendSortedUnique(nil, summary.FilesTouched...),
+		TokenUsage:     summary.TokenUsage,
+		Completeness:   EvidenceStatus{State: EvidenceComplete},
+		PromptEvidence: EvidenceStatus{State: EvidenceUnavailable, Reasons: []string{"no prompt evidence read yet"}},
+		Graph:          GraphContext{State: EvidenceUnavailable, Available: false, UnavailableReason: "graph provider not configured"},
 		Provenance: Provenance{
 			CheckpointID: checkpointID,
 			Sources: []EvidenceSource{
-				{Kind: "checkpoint", ID: checkpointID.String(), Description: "Entire checkpoint metadata", Available: true},
+				{Kind: "checkpoint", ID: checkpointID.String(), Description: "Entire checkpoint metadata", Available: true, State: EvidenceComplete},
 			},
 		},
 	}
@@ -139,10 +141,10 @@ func (b Builder) Build(ctx context.Context, checkpointID id.CheckpointID) (*Cont
 	ac.ChangedFiles = gitEvidence.ChangedFiles
 	ac.Provenance.CommitSHAs = commitSHAs(gitEvidence.AssociatedCommits)
 	ac.Provenance.Sources = append(ac.Provenance.Sources,
-		EvidenceSource{Kind: "git", ID: strings.Join(ac.Provenance.CommitSHAs, ","), Description: "Commits and diff associated through Entire-Checkpoint trailers or checkpoint commit metadata", Available: len(gitEvidence.AssociatedCommits) > 0},
+		EvidenceSource{Kind: "git", ID: strings.Join(ac.Provenance.CommitSHAs, ","), Description: "Commits and diff associated through Entire-Checkpoint trailers or checkpoint commit metadata", Available: len(gitEvidence.AssociatedCommits) > 0, State: gitEvidence.State},
 	)
 
-	graph := GraphContext{Available: false, UnavailableReason: "graph provider not configured"}
+	graph := GraphContext{State: EvidenceUnavailable, Available: false, UnavailableReason: "graph provider not configured"}
 	if b.Graph != nil {
 		graph, err = b.Graph.CollectGraphEvidence(ctx, GraphRequest{
 			CheckpointID: checkpointID,
@@ -150,15 +152,17 @@ func (b Builder) Build(ctx context.Context, checkpointID id.CheckpointID) (*Cont
 			FilesTouched: ac.FilesTouched,
 		})
 		if err != nil {
-			graph = GraphContext{Available: false, UnavailableReason: err.Error()}
+			graph = GraphContext{State: EvidenceUnavailable, Available: false, UnavailableReason: err.Error()}
 		} else if !graph.Available && graph.UnavailableReason == "" {
 			graph.UnavailableReason = "graph provider returned no evidence"
 		}
+		graph.State = graphState(graph)
 	}
 	ac.Graph = graph
 	ac.Provenance.Sources = append(ac.Provenance.Sources,
-		EvidenceSource{Kind: "graph", Description: "Optional Entire Graph structural evidence", Available: graph.Available},
+		EvidenceSource{Kind: "graph", Description: "Optional Entire Graph structural evidence", Available: graph.Available, State: graph.State},
 	)
+	ac.Completeness = computeCompleteness(ac)
 
 	return ac, nil
 }
@@ -196,12 +200,14 @@ func (b Builder) addSessions(ctx context.Context, ac *Context, checkpointID id.C
 			PromptCount:            len(prompts),
 			SkillEventCount:        len(meta.SkillEvents),
 		}
+		session.PromptEvidence = promptEvidenceStatus(prompts)
 		if len(content.Transcript) == 0 {
 			session.TranscriptUnavailable = true
 			session.TranscriptUnavailableReason = "session transcript empty or unavailable"
 		}
 		for j, prompt := range prompts {
 			p := Prompt{SessionIndex: i, PromptIndex: j, Text: prompt}
+			p.State, p.Reason = classifyTextEvidence(prompt)
 			session.Prompts = append(session.Prompts, p)
 			ac.ScopedPrompts = append(ac.ScopedPrompts, p)
 			if ac.DeveloperPrompt == "" {
@@ -222,33 +228,36 @@ func (b Builder) addSessions(ctx context.Context, ac *Context, checkpointID id.C
 			ac.TaskRecords = append(ac.TaskRecords, TaskRecord{ToolUseID: session.ToolUseID})
 		}
 		if len(content.Transcript) > 0 && !ac.Transcript.Available {
-			ac.Transcript = TranscriptRef{Available: true, SessionID: session.SessionID, SessionIndex: i, ByteLength: len(content.Transcript)}
+			state, _ := classifyTextEvidence(string(content.Transcript))
+			ac.Transcript = TranscriptRef{State: state, Available: true, SessionID: session.SessionID, SessionIndex: i, ByteLength: len(content.Transcript), Redacted: state == EvidenceRedacted}
 		}
 	}
 	if !ac.Transcript.Available {
-		ac.Transcript = TranscriptRef{Available: false, UnavailableReason: "no session transcript bytes available"}
+		ac.Transcript = TranscriptRef{State: EvidenceUnavailable, Available: false, UnavailableReason: "no session transcript bytes available"}
 	}
+	ac.PromptEvidence = promptEvidenceStatusFromPrompts(ac.ScopedPrompts)
 	ac.Provenance.SessionIDs = appendSortedUnique(nil, ac.Provenance.SessionIDs...)
 	ac.Provenance.Sources = append(ac.Provenance.Sources,
-		EvidenceSource{Kind: "session", ID: strings.Join(ac.Provenance.SessionIDs, ","), Description: "Entire checkpoint session metadata, prompts, and transcript availability", Available: len(ac.Sessions) > 0},
+		EvidenceSource{Kind: "session", ID: strings.Join(ac.Provenance.SessionIDs, ","), Description: "Entire checkpoint session metadata, prompts, and transcript availability", Available: len(ac.Sessions) > 0, State: aggregateEvidenceState(ac.PromptEvidence.State, ac.Transcript.State)},
 	)
 	return nil
 }
 
 func (b Builder) collectGitEvidence(ctx context.Context, checkpointID id.CheckpointID, summary *checkpoint.CheckpointSummary) GitEvidence {
 	if b.Repo == nil {
-		return GitEvidence{DiffUnavailableReason: "git repository not configured", ChangedFilesUnavailable: "git repository not configured"}
+		return GitEvidence{State: EvidenceUnavailable, DiffUnavailableReason: "git repository not configured", ChangedFilesUnavailable: "git repository not configured"}
 	}
 	commits, err := findAssociatedCommits(ctx, b.Repo, checkpointID, summary.CommitSHA)
 	if err != nil {
-		return GitEvidence{DiffUnavailableReason: err.Error(), ChangedFilesUnavailable: err.Error()}
+		return GitEvidence{State: EvidenceUnavailable, DiffUnavailableReason: err.Error(), ChangedFilesUnavailable: err.Error()}
 	}
 	if len(commits) == 0 {
-		return GitEvidence{DiffUnavailableReason: "no associated commits found", ChangedFilesUnavailable: "no associated commits found"}
+		return GitEvidence{State: EvidenceUnavailable, DiffUnavailableReason: "no associated commits found", ChangedFilesUnavailable: "no associated commits found"}
 	}
 
-	evidence := GitEvidence{AssociatedCommits: commits}
+	evidence := GitEvidence{AssociatedCommits: commits, State: EvidenceComplete}
 	if b.RepoRoot == "" {
+		evidence.State = EvidenceUnavailable
 		evidence.DiffUnavailableReason = "repository root not configured"
 		evidence.ChangedFilesUnavailable = "repository root not configured"
 		return evidence
@@ -281,6 +290,9 @@ func (b Builder) collectGitEvidence(ctx context.Context, checkpointID id.Checkpo
 	evidence.Diff = diff.String()
 	if evidence.Diff != "" {
 		evidence.DiffUnavailableReason = ""
+	}
+	if evidence.DiffUnavailableReason != "" || evidence.ChangedFilesUnavailable != "" {
+		evidence.State = EvidenceUnavailable
 	}
 	return evidence
 }
@@ -410,6 +422,113 @@ func emptyIfChanged(reason string, changed map[string]struct{}) string {
 	return reason
 }
 
+func classifyTextEvidence(text string) (EvidenceState, string) {
+	if text == "" {
+		return EvidenceUnavailable, "evidence empty or unavailable"
+	}
+	if containsRedactionMarker(text) {
+		return EvidenceRedacted, "evidence contains redaction marker"
+	}
+	return EvidenceComplete, ""
+}
+
+func containsRedactionMarker(text string) bool {
+	return strings.Contains(text, "REDACTED") || strings.Contains(text, "[REDACTED_")
+}
+
+func promptEvidenceStatus(prompts []string) EvidenceStatus {
+	if len(prompts) == 0 {
+		return EvidenceStatus{State: EvidenceUnavailable, Reasons: []string{"no prompt evidence available"}}
+	}
+	state := EvidenceComplete
+	var reasons []string
+	for _, prompt := range prompts {
+		promptState, reason := classifyTextEvidence(prompt)
+		state = aggregateEvidenceState(state, promptState)
+		if reason != "" {
+			reasons = appendSortedUnique(reasons, reason)
+		}
+	}
+	return EvidenceStatus{State: state, Reasons: reasons}
+}
+
+func promptEvidenceStatusFromPrompts(prompts []Prompt) EvidenceStatus {
+	if len(prompts) == 0 {
+		return EvidenceStatus{State: EvidenceUnavailable, Reasons: []string{"no prompt evidence available"}}
+	}
+	state := EvidenceComplete
+	var reasons []string
+	for _, prompt := range prompts {
+		state = aggregateEvidenceState(state, prompt.State)
+		if prompt.Reason != "" {
+			reasons = appendSortedUnique(reasons, prompt.Reason)
+		}
+	}
+	return EvidenceStatus{State: state, Reasons: reasons}
+}
+
+func graphState(graph GraphContext) EvidenceState {
+	if !graph.Available {
+		return EvidenceUnavailable
+	}
+	if len(graph.Evidence) == 0 {
+		return EvidenceUnavailable
+	}
+	state := EvidenceComplete
+	for _, evidence := range graph.Evidence {
+		if evidence.Detail == "" {
+			continue
+		}
+		evidenceState, _ := classifyTextEvidence(evidence.Detail)
+		state = aggregateEvidenceState(state, evidenceState)
+	}
+	return state
+}
+
+func aggregateEvidenceState(current, next EvidenceState) EvidenceState {
+	if current == "" {
+		current = EvidenceComplete
+	}
+	if next == "" {
+		next = EvidenceComplete
+	}
+	if current == EvidenceUnavailable || next == EvidenceUnavailable {
+		return EvidenceUnavailable
+	}
+	if current == EvidenceRedacted || next == EvidenceRedacted {
+		return EvidenceRedacted
+	}
+	return EvidenceComplete
+}
+
+func computeCompleteness(ac *Context) EvidenceStatus {
+	state := EvidenceComplete
+	var reasons []string
+	add := func(component string, componentState EvidenceState, reason string) {
+		state = aggregateEvidenceState(state, componentState)
+		if componentState != EvidenceComplete {
+			if reason == "" {
+				reason = "evidence is " + string(componentState)
+			}
+			reasons = appendSortedUnique(reasons, component+": "+reason)
+		}
+	}
+	add("prompt", ac.PromptEvidence.State, strings.Join(ac.PromptEvidence.Reasons, "; "))
+	add("transcript", ac.Transcript.State, ac.Transcript.UnavailableReason)
+	add("git", ac.Git.State, firstNonEmpty(ac.Git.DiffUnavailableReason, ac.Git.ChangedFilesUnavailable))
+	add("graph", ac.Graph.State, ac.Graph.UnavailableReason)
+	return EvidenceStatus{State: state, Reasons: reasons}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // GraphCLIProvider shells out to the installed Entire Graph CLI. It is optional
 // by design: failures are converted to unavailable GraphContext by Builder.
 type GraphCLIProvider struct {
@@ -444,7 +563,7 @@ func (p GraphCLIProvider) CollectGraphEvidence(ctx context.Context, req GraphReq
 
 	detail := stdout.String()
 	if strings.TrimSpace(detail) == "" {
-		return GraphContext{Available: false, UnavailableReason: "entire graph returned no evidence"}, nil
+		return GraphContext{State: EvidenceUnavailable, Available: false, UnavailableReason: "entire graph returned no evidence"}, nil
 	}
 	maxBytes := p.MaxBytes
 	if maxBytes <= 0 {
@@ -455,6 +574,7 @@ func (p GraphCLIProvider) CollectGraphEvidence(ctx context.Context, req GraphReq
 	}
 
 	return GraphContext{
+		State:     graphState(GraphContext{Available: true, Evidence: []GraphEvidence{{Detail: detail}}}),
 		Available: true,
 		Evidence: []GraphEvidence{{
 			Query:  "entire graph checkpoint " + req.CheckpointID.String() + " --json",

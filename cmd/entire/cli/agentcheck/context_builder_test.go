@@ -71,9 +71,11 @@ func (f fakeReader) ReadSessionMetadataAndPrompts(_ context.Context, cpID id.Che
 type fakeGraph struct {
 	ctx GraphContext
 	err error
+	req GraphRequest
 }
 
-func (f fakeGraph) CollectGraphEvidence(context.Context, GraphRequest) (GraphContext, error) {
+func (f *fakeGraph) CollectGraphEvidence(_ context.Context, req GraphRequest) (GraphContext, error) {
+	f.req = req
 	return f.ctx, f.err
 }
 
@@ -83,7 +85,7 @@ func TestBuildValidCheckpointProducesContext(t *testing.T) {
 		Reader:   testReader(),
 		Repo:     repo,
 		RepoRoot: repoRoot,
-		Graph:    fakeGraph{ctx: GraphContext{Available: true, Evidence: []GraphEvidence{{Kind: "definition", Paths: []string{"feature.go"}}}}},
+		Graph:    &fakeGraph{ctx: GraphContext{Available: true, Evidence: []GraphEvidence{{Kind: "definition", Paths: []string{"feature.go"}}}}},
 	}.Build(context.Background(), testCheckpointID)
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
@@ -96,6 +98,9 @@ func TestBuildValidCheckpointProducesContext(t *testing.T) {
 	}
 	if !ctx.Graph.Available {
 		t.Fatal("Graph.Available = false, want true")
+	}
+	if ctx.Completeness.State != EvidenceComplete {
+		t.Fatalf("Completeness = %+v, want complete", ctx.Completeness)
 	}
 }
 
@@ -124,6 +129,78 @@ func TestBuildPreservesOriginalDeveloperPrompt(t *testing.T) {
 	}
 	if len(ctx.ScopedPrompts) != 3 {
 		t.Fatalf("len(ScopedPrompts) = %d, want 3", len(ctx.ScopedPrompts))
+	}
+}
+
+func TestBuildMarksRedactedCheckpointContextIncomplete(t *testing.T) {
+	reader := testReader()
+	reader.sessions[0].Prompts = "Implement login with token REDACTED."
+	reader.sessions[0].Transcript = []byte(`{"content":"token REDACTED"}`)
+	repoRoot, repo := repoWithCheckpointCommit(t, testCheckpointID)
+	ctx, err := Builder{
+		Reader:   reader,
+		Repo:     repo,
+		RepoRoot: repoRoot,
+		Graph:    &fakeGraph{ctx: GraphContext{Available: true, Evidence: []GraphEvidence{{Kind: "definition", Detail: "local graph evidence"}}}},
+	}.Build(context.Background(), testCheckpointID)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if ctx.PromptEvidence.State != EvidenceRedacted {
+		t.Fatalf("PromptEvidence = %+v, want redacted", ctx.PromptEvidence)
+	}
+	if ctx.Transcript.State != EvidenceRedacted || !ctx.Transcript.Redacted {
+		t.Fatalf("Transcript = %+v, want redacted", ctx.Transcript)
+	}
+	if ctx.Completeness.State != EvidenceRedacted {
+		t.Fatalf("Completeness = %+v, want redacted", ctx.Completeness)
+	}
+}
+
+func TestBuildMissingTranscriptIsExplicitlyIncomplete(t *testing.T) {
+	reader := testReader()
+	reader.sessions[0].Transcript = nil
+	reader.sessions[1].Transcript = nil
+	repoRoot, repo := repoWithCheckpointCommit(t, testCheckpointID)
+	ctx, err := Builder{
+		Reader:   reader,
+		Repo:     repo,
+		RepoRoot: repoRoot,
+		Graph:    &fakeGraph{ctx: GraphContext{Available: true, Evidence: []GraphEvidence{{Kind: "definition", Detail: "local graph evidence"}}}},
+	}.Build(context.Background(), testCheckpointID)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if ctx.Transcript.State != EvidenceUnavailable {
+		t.Fatalf("Transcript = %+v, want unavailable", ctx.Transcript)
+	}
+	if ctx.Completeness.State == EvidenceComplete {
+		t.Fatalf("Completeness = %+v, must not be complete", ctx.Completeness)
+	}
+}
+
+func TestBuildMissingPromptIsExplicitlyIncomplete(t *testing.T) {
+	reader := testReader()
+	reader.sessions[0].Prompts = ""
+	reader.sessions[1].Prompts = ""
+	repoRoot, repo := repoWithCheckpointCommit(t, testCheckpointID)
+	ctx, err := Builder{
+		Reader:   reader,
+		Repo:     repo,
+		RepoRoot: repoRoot,
+		Graph:    &fakeGraph{ctx: GraphContext{Available: true, Evidence: []GraphEvidence{{Kind: "definition", Detail: "local graph evidence"}}}},
+	}.Build(context.Background(), testCheckpointID)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if ctx.PromptEvidence.State != EvidenceUnavailable {
+		t.Fatalf("PromptEvidence = %+v, want unavailable", ctx.PromptEvidence)
+	}
+	if ctx.DeveloperPrompt != "" || len(ctx.ScopedPrompts) != 0 {
+		t.Fatalf("prompt text fabricated: developer=%q scoped=%+v", ctx.DeveloperPrompt, ctx.ScopedPrompts)
+	}
+	if ctx.Completeness.State == EvidenceComplete {
+		t.Fatalf("Completeness = %+v, must not be complete", ctx.Completeness)
 	}
 }
 
@@ -167,6 +244,26 @@ func TestBuildGraphUnavailableDoesNotBreakContext(t *testing.T) {
 	}
 	if ctx.Graph.UnavailableReason == "" {
 		t.Fatal("Graph.UnavailableReason is empty")
+	}
+	if ctx.Completeness.State == EvidenceComplete {
+		t.Fatalf("Completeness = %+v, must not be complete when graph is unavailable", ctx.Completeness)
+	}
+}
+
+func TestBuildDoesNotSendRawPromptOrTranscriptToGraphProvider(t *testing.T) {
+	graph := &fakeGraph{ctx: GraphContext{Available: true, Evidence: []GraphEvidence{{Kind: "definition", Detail: "local graph evidence"}}}}
+	ctx, err := Builder{Reader: testReader(), Graph: graph}.Build(context.Background(), testCheckpointID)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if ctx.DeveloperPrompt == "" || len(ctx.ScopedPrompts) == 0 || ctx.Transcript.ByteLength == 0 {
+		t.Fatalf("test fixture lost prompt/transcript evidence: %+v", ctx)
+	}
+	got := strings.Join(graph.req.FilesTouched, "\n") + strings.Join(pathsFromFileChanges(graph.req.ChangedFiles), "\n")
+	for _, sensitive := range []string{"Implement Google OAuth login", "Do NOT modify the database schema", "response_item"} {
+		if strings.Contains(got, sensitive) {
+			t.Fatalf("GraphRequest leaked raw prompt/transcript %q in %+v", sensitive, graph.req)
+		}
 	}
 }
 
