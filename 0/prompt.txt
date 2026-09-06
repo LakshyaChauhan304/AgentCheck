@@ -1,0 +1,16 @@
+PRE-CURVEBALL CHECKPOINT VERIFICATION
+Checkpoint ID:\
+01M1TXD79GSQ2NHF970KQFGQGA
+Readable: YES
+Contains intent: YES
+Contains architecture: YES
+Contains completed work: YES
+Contains risks/assumptions: YES
+Contains verification state: YES
+Session ID:\
+01a07543-b144-7ae2-9c6e-f6b65fc3a474
+Session ended: YES
+Remote sync state:\
+Checkpoints sync remote is `origin`; `entire status --json` still reports no active sessions and Codex hook trust as `trust_review_needed`.
+Working tree preserved: YES
+Curveball implementation started: NO
