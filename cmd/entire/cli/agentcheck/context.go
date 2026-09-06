@@ -14,10 +14,12 @@ import (
 type Context struct {
 	CheckpointID id.CheckpointID `json:"checkpoint_id"`
 	Checkpoint   Checkpoint      `json:"checkpoint"`
+	Completeness EvidenceStatus  `json:"completeness"`
 	Sessions     []Session       `json:"sessions"`
 
-	DeveloperPrompt string   `json:"developer_prompt,omitempty"`
-	ScopedPrompts   []Prompt `json:"scoped_prompts,omitempty"`
+	DeveloperPrompt string         `json:"developer_prompt,omitempty"`
+	ScopedPrompts   []Prompt       `json:"scoped_prompts,omitempty"`
+	PromptEvidence  EvidenceStatus `json:"prompt_evidence"`
 
 	AgentType  string            `json:"agent_type,omitempty"`
 	Model      string            `json:"model,omitempty"`
@@ -71,14 +73,17 @@ type Session struct {
 	TranscriptUnavailableReason string            `json:"transcript_unavailable_reason,omitempty"`
 	PromptCount                 int               `json:"prompt_count,omitempty"`
 	Prompts                     []Prompt          `json:"prompts,omitempty"`
+	PromptEvidence              EvidenceStatus    `json:"prompt_evidence"`
 	SkillEventCount             int               `json:"skill_event_count,omitempty"`
 }
 
 // Prompt preserves raw prompt text as stored in Entire checkpoint prompt data.
 type Prompt struct {
-	SessionIndex int    `json:"session_index"`
-	PromptIndex  int    `json:"prompt_index"`
-	Text         string `json:"text"`
+	SessionIndex int           `json:"session_index"`
+	PromptIndex  int           `json:"prompt_index"`
+	Text         string        `json:"text"`
+	State        EvidenceState `json:"state"`
+	Reason       string        `json:"reason,omitempty"`
 }
 
 // FileChange is a changed path associated with checkpoint commits.
@@ -99,6 +104,7 @@ type AssociatedCommit struct {
 // GitEvidence is the checkpoint-associated git evidence AgentCheck saw.
 type GitEvidence struct {
 	AssociatedCommits       []AssociatedCommit `json:"associated_commits,omitempty"`
+	State                   EvidenceState      `json:"state"`
 	ChangedFiles            []FileChange       `json:"changed_files,omitempty"`
 	Diff                    string             `json:"diff,omitempty"`
 	DiffUnavailableReason   string             `json:"diff_unavailable_reason,omitempty"`
@@ -108,11 +114,13 @@ type GitEvidence struct {
 // TranscriptRef records whether transcript bytes were available without making
 // downstream evaluators understand checkpoint storage paths.
 type TranscriptRef struct {
-	Available         bool   `json:"available"`
-	SessionID         string `json:"session_id,omitempty"`
-	SessionIndex      int    `json:"session_index,omitempty"`
-	ByteLength        int    `json:"byte_length,omitempty"`
-	UnavailableReason string `json:"unavailable_reason,omitempty"`
+	State             EvidenceState `json:"state"`
+	Available         bool          `json:"available"`
+	SessionID         string        `json:"session_id,omitempty"`
+	SessionIndex      int           `json:"session_index,omitempty"`
+	ByteLength        int           `json:"byte_length,omitempty"`
+	Redacted          bool          `json:"redacted,omitempty"`
+	UnavailableReason string        `json:"unavailable_reason,omitempty"`
 }
 
 // TaskRecord is reserved for durable subagent/task records when a stable reader
@@ -125,6 +133,7 @@ type TaskRecord struct {
 // GraphContext records optional graph evidence. Unavailable Graph never blocks
 // context construction.
 type GraphContext struct {
+	State             EvidenceState   `json:"state"`
 	Available         bool            `json:"available"`
 	UnavailableReason string          `json:"unavailable_reason,omitempty"`
 	Evidence          []GraphEvidence `json:"evidence,omitempty"`
@@ -151,8 +160,26 @@ type Provenance struct {
 
 // EvidenceSource identifies where one class of context evidence came from.
 type EvidenceSource struct {
-	Kind        string `json:"kind"`
-	ID          string `json:"id,omitempty"`
-	Description string `json:"description,omitempty"`
-	Available   bool   `json:"available"`
+	Kind        string        `json:"kind"`
+	ID          string        `json:"id,omitempty"`
+	Description string        `json:"description,omitempty"`
+	Available   bool          `json:"available"`
+	State       EvidenceState `json:"state,omitempty"`
+}
+
+// EvidenceState describes whether a piece of evidence is complete, redacted, or
+// unavailable. Downstream evaluators must treat non-complete evidence as
+// incomplete, not as authoritative absence.
+type EvidenceState string
+
+const (
+	EvidenceComplete    EvidenceState = "complete"
+	EvidenceRedacted    EvidenceState = "redacted"
+	EvidenceUnavailable EvidenceState = "unavailable"
+)
+
+// EvidenceStatus aggregates availability for a context component.
+type EvidenceStatus struct {
+	State   EvidenceState `json:"state"`
+	Reasons []string      `json:"reasons,omitempty"`
 }
